@@ -411,3 +411,88 @@ if __name__ == "__main__":
 
     status, payload = call("GET", "/revisions/999999")
     show("未知修订号（预期 404）", status, payload)
+
+    # ---- 现场出口清点：登记 / 幂等重试 / 留痕更正 / 按组汇总 ----
+    # 组1（10人）：1->2（2分钟）->6（2分钟），第 4 分钟抵达出口 6
+    status, plan = call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 2, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10},
+        ],
+        "exits": [6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30}],
+    })
+    assert status == 200
+    call("POST", "/tick", {"minutes": 4})
+
+    # 清点分钟早于到达分钟 -> 409 COUNT_MINUTE_BEFORE_ARRIVAL
+    status, payload = call("POST", "/headcounts",
+                           {"serial": "hc-early", "group_id": 1,
+                            "exit_id": 6, "count": 5, "count_minute": 2})
+    show("组在清点分钟尚未到达（预期 409 COUNT_MINUTE_BEFORE_ARRIVAL）",
+         status, payload)
+
+    # 正式登记：第 4 分钟在出口 6 清点 6 人（arrival_type=planned_arrival）
+    status, rec = call("POST", "/headcounts",
+                       {"serial": "hc-001", "group_id": 1, "exit_id": 6,
+                        "count": 6, "count_minute": 4})
+    show("登记清点 hc-001（组1/出口6/6人，版本1）", status, rec)
+
+    # 同流水号同内容重试：幂等返回原记录（200, replayed=true）
+    status, rec = call("POST", "/headcounts",
+                       {"serial": "hc-001", "group_id": 1, "exit_id": 6,
+                        "count": 6, "count_minute": 4})
+    show("同流水号同内容重试（预期 200, replayed=true）", status, rec)
+    assert status == 200 and rec["replayed"] is True
+
+    # 同流水号异内容 -> 409 HEADCOUNT_CONFLICT
+    status, payload = call("POST", "/headcounts",
+                           {"serial": "hc-001", "group_id": 1, "exit_id": 6,
+                            "count": 5, "count_minute": 4})
+    show("同流水号异内容（预期 409 HEADCOUNT_CONFLICT）", status, payload)
+
+    # 同组累计超额：6+5 > 10 -> 409 GROUP_COUNT_EXCEEDED
+    status, payload = call("POST", "/headcounts",
+                           {"serial": "hc-002", "group_id": 1, "exit_id": 6,
+                            "count": 5, "count_minute": 4})
+    show("累计清点超过组人数（预期 409 GROUP_COUNT_EXCEEDED）", status, payload)
+
+    # 留痕更正：凭原流水号+原版本1+非空原因把 6 -> 4（版本变 2、原值保留）
+    status, rec = call("POST", "/headcounts/hc-001/corrections",
+                       {"version": 1, "count": 4, "reason": "重复清点2人"})
+    show("更正 hc-001：6 -> 4（版本 2，历史保留原值）", status, rec)
+
+    # 对已消费版本重复更正 / 拿不存在的版本 -> 409
+    status, payload = call("POST", "/headcounts/hc-001/corrections",
+                           {"version": 1, "count": 3,
+                            "reason": "对同一版本重复更正"})
+    show("对同一版本重复更正（预期 409 ALREADY_CORRECTED）", status, payload)
+    status, payload = call("POST", "/headcounts/hc-001/corrections",
+                           {"version": 9, "count": 3,
+                            "reason": "基于不存在的版本"})
+    show("版本失配（预期 409 VERSION_MISMATCH）", status, payload)
+
+    # 更正腾出名额后再登记 5 人：4+5=9 受理
+    status, rec = call("POST", "/headcounts",
+                       {"serial": "hc-002", "group_id": 1, "exit_id": 6,
+                        "count": 5, "count_minute": 4})
+    show("更正腾出名额后登记 hc-002（5人，4+5=9）", status, rec)
+
+    # 按组汇总：应到 10 / 已清点 9 / 未清点 1，逐条记录含更正历史
+    status, report = call("GET", "/headcounts")
+    show("按组清点汇总（应到/已清点/未清点 + 逐条记录）", status, report)
+    for g in report["groups"]:
+        print(f"  组 {g['group_id']}：应到 {g['expected_count']} / "
+              f"已清点 {g['counted_count']} / 未清点 "
+              f"{g['remaining_count']}，{len(g['records'])} 条记录")
+        for r in g["records"]:
+            print(f"    - {r['serial']}：出口 {r['exit_id']} "
+                  f"当前 {r['count']} 人（版本 {r['version']}，"
+                  f"{r['arrival_type']}@{r['arrival_minute']}，"
+                  f"{len(r['corrections'])} 次更正）")
+    status, payload = call("GET", "/groups/1/headcounts")
+    show("单组清点查询 GET /groups/1/headcounts", status, payload)
+    status, payload = call("GET", "/groups/999/headcounts")
+    show("未知组号（预期 404）", status, payload)

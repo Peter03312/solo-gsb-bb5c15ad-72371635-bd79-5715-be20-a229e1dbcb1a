@@ -170,6 +170,79 @@ class RescueTaskListOut(BaseModel):
     tasks: list[RescueTaskOut]
 
 
+# --------------------------------------------------------------------------
+# 现场出口清点
+# --------------------------------------------------------------------------
+
+class HeadcountIn(BaseModel):
+    """现场在出口按人群组提交一条实际撤离人数清点。"""
+    serial: str = Field(
+        ..., min_length=1,
+        description="非空唯一流水号；同流水号同内容重试幂等返回原记录")
+    group_id: int = Field(..., ge=1, description="被清点的人群组编号")
+    exit_id: int = Field(..., ge=0, description="清点所在出口编号")
+    count: int = Field(..., gt=0, description="本次清点人数（正整数）")
+    count_minute: int = Field(
+        ..., ge=0,
+        description="清点分钟（不早于该组相应到达分钟、不晚于当前分钟）")
+
+
+class HeadcountCorrectionIn(BaseModel):
+    """凭原流水号、原记录版本与非空原因，将一条清点更正为非负人数。"""
+    version: int = Field(
+        ..., ge=1, description="更正所基于的原记录版本（须与当前版本一致）")
+    count: int = Field(..., ge=0, description="更正后的人数（非负整数）")
+    reason: str = Field(
+        ..., min_length=1,
+        description="非空更正原因（纯空白同样拒绝）")
+
+
+class HeadcountCorrectionOut(BaseModel):
+    """一条清点记录的单次更正历史（原值保留）。"""
+    from_version: int = Field(description="更正所基于的版本")
+    to_version: int = Field(description="更正后的版本")
+    old_count: int = Field(description="更正前人数")
+    new_count: int = Field(description="更正后人数")
+    reason: str
+    corrected_minute: int
+
+
+class HeadcountRecordOut(BaseModel):
+    """一条出口清点记录（count 为更正后的当前值，更正历史逐条给出）。"""
+    serial: str
+    group_id: int
+    exit_id: int
+    count: int = Field(description="当前人数（经更正后的值；原值见 corrections）")
+    count_minute: int
+    version: int = Field(description="记录版本：初始为 1，每次成功更正 +1")
+    # planned_arrival=按固定路线抵达该出口；actual_delivery=人工救援实际送达
+    arrival_type: str
+    arrival_minute: int = Field(
+        description="登记时采用的到达分钟：规划到达或人工实际送达分钟")
+    registered_minute: int = Field(description="首次登记时的当前分钟")
+    corrections: list[HeadcountCorrectionOut] = Field(
+        default_factory=list, description="更正历史（按发生顺序，原值逐条保留）")
+
+
+class HeadcountRecordResultOut(HeadcountRecordOut):
+    """清点提交/更正响应：replayed=true 表示同流水号同内容重试返回原记录。"""
+    replayed: bool = False
+
+
+class HeadcountGroupOut(BaseModel):
+    """单组清点汇总：应到、已清点、未清点及逐条记录。"""
+    group_id: int
+    expected_count: int = Field(description="应到人数（组人数）")
+    counted_count: int = Field(description="已清点人数（该组全部当前记录人数之和）")
+    remaining_count: int = Field(description="未清点人数（应到 - 已清点，不为负）")
+    records: list[HeadcountRecordOut]
+
+
+class HeadcountReportOut(BaseModel):
+    current_minute: int
+    groups: list[HeadcountGroupOut]
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")

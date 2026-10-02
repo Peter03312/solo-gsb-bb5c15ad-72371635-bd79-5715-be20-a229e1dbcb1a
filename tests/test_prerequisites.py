@@ -395,9 +395,9 @@ def test_leader_rescuing_blocks_and_rescued_uses_actual_delivery(client):
     register(client, 3, 1, 2)
     _make_leader_awaiting_rescue(client)
     client.post("/rescue-teams", json={"team_id": 1, "capacity": 10})
-    assert client.post("/rescue-tasks", json={
+    task_id = client.post("/rescue-tasks", json={
         "group_id": 1, "team_id": 1, "node_id": 2,
-        "observed_minute": 4}).status_code == 201
+        "observed_minute": 4}).json()["task_id"]
     # 救援中（派遣不触发重排，/plan 依据实时计算）
     g3 = by_id(client.get("/plan").json())[3]
     assert g3["status"] == "blocked"
@@ -405,7 +405,7 @@ def test_leader_rescuing_blocks_and_rescued_uses_actual_delivery(client):
 
     # tick 到9 结案：实际送达9 -> 后继锚点 9+2=11，零步路线到达11
     client.post("/tick", json={"minutes": 5})
-    resp = client.post("/rescue-tasks/1/completion",
+    resp = client.post(f"/rescue-tasks/{task_id}/completion",
                        json={"exit_id": 6, "delivery_minute": 9})
     assert resp.status_code == 200
     plan = by_id(client.get("/plan").json())

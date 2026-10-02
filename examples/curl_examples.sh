@@ -4,7 +4,8 @@
 # 依次演示：初始化、新增组、新增封闭、推进分钟、409 拒绝、容量管制登记/
 # 重叠/超载拒绝、有效上限核验、组纠正、现场节点滞留报告（受理/拒绝/待救援）、
 # 人工救援队登记/派遣拒绝/派遣受理/结案核销、先导关系登记/替换/拒绝/前置
-# 未满足/多级依赖/人工送达锚点、修订追溯。
+# 未满足/多级依赖/人工送达锚点、现场出口清点登记/幂等重试/超额/留痕更正/
+# 版本失配/按组汇总、修订追溯。
 set -euo pipefail
 
 BASE="${1:-${BASE:-http://localhost:8000}}"
@@ -385,5 +386,84 @@ curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
 curl -s -X POST "$BASE/rescue-tasks/$TASK_ID/completion" -H 'Content-Type: application/json' \
   -d '{"exit_id": 6, "delivery_minute": 9}' | python3 -m json.tool
 curl -s "$BASE/plan" | python3 -m json.tool
+
+# ---- 现场出口清点：登记 / 幂等重试 / 留痕更正 / 按组汇总 ----
+say "52) 重置为清点演示场景：组1(10人)1->2->6 第4分钟到达出口6"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 2, "capacity": 10},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10}
+    ],
+    "exits": [6], "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 4}' > /dev/null
+
+say "53) 组尚未到达时清点（第4分钟才到达，第2分钟清点 -> 409 COUNT_MINUTE_BEFORE_ARRIVAL）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/headcounts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "hc-early", "group_id": 1, "exit_id": 6, "count": 5, "count_minute": 2}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "54) 正式清点：流水号 hc-001，组1 在出口6、第4分钟清点 6 人（HTTP 201）"
+curl -s -X POST "$BASE/headcounts" -H 'Content-Type: application/json' \
+  -d '{"serial": "hc-001", "group_id": 1, "exit_id": 6, "count": 6, "count_minute": 4}' \
+  | python3 -m json.tool
+
+say "55) 同流水号同内容重试：幂等返回原记录（HTTP 200，replayed=true）"
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/headcounts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "hc-001", "group_id": 1, "exit_id": 6, "count": 6, "count_minute": 4}'
+
+say "56) 同流水号异内容（改人数 -> 409 HEADCOUNT_CONFLICT，原记录不变）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/headcounts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "hc-001", "group_id": 1, "exit_id": 6, "count": 5, "count_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "57) 累计超额：再清点 5 人（6+5>10 -> 409 GROUP_COUNT_EXCEEDED，附组人数/已清点/累计）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/headcounts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "hc-002", "group_id": 1, "exit_id": 6, "count": 5, "count_minute": 4}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "58) 留痕更正：凭原流水号+原版本1+非空原因，把 hc-001 人数 6->4（版本变2，原值保留）"
+curl -s -X POST "$BASE/headcounts/hc-001/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "count": 4, "reason": "重复清点2人"}' | python3 -m json.tool
+
+say "59) 对已消费的版本1重复更正（409 ALREADY_CORRECTED）；拿不存在的版本9（409 VERSION_MISMATCH）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/headcounts/hc-001/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "count": 3, "reason": "对同一版本重复更正"}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/headcounts/hc-001/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 9, "count": 3, "reason": "基于不存在的版本"}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "60) 更正后腾出名额：再清点 hc-002 共5人（4+5=9 受理）；清点/更正均不产生修订"
+curl -s -X POST "$BASE/headcounts" -H 'Content-Type: application/json' \
+  -d '{"serial": "hc-002", "group_id": 1, "exit_id": 6, "count": 5, "count_minute": 4}' \
+  | python3 -m json.tool
+
+say "61) 按组汇总：应到10、已清点9、未清点1，逐条记录含更正历史（arrival_type=planned_arrival）"
+curl -s "$BASE/headcounts" | python3 -m json.tool
+curl -s "$BASE/groups/1/headcounts" | python3 -m json.tool
+
+say "62) 未知组号查询（404）；未知流水号更正（404）；空白原因（422）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/groups/999/headcounts"
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/headcounts/nope/corrections" \
+  -H 'Content-Type: application/json' -d '{"version": 1, "count": 1, "reason": "x"}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/headcounts/hc-002/corrections" \
+  -H 'Content-Type: application/json' -d '{"version": 1, "count": 1, "reason": "   "}'
+python3 -m json.tool /tmp/resp.json || true
 
 say "完成。交互文档： $BASE/docs"

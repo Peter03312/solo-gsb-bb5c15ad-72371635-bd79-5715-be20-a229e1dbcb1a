@@ -20,6 +20,11 @@
 先导已人工送达时改用实际送达分钟；先导待救援、救援中或无可行路线时后继
 
 标记**前置未满足**（不占通道），多级关系按依赖顺序安排。
+支持现场在出口按人群组**清点实际撤离人数**：提交非空唯一流水号、组号、
+出口号、正整数人数与非负清点分钟（同流水号幂等重试），仅已按固定路线
+抵达该出口或已由人工救援实际送达该出口的组可登记，同组累计不超组人数；
+可凭原流水号、原记录版本与非空原因**留痕更正**为非负人数（原值与历史
+保留），查询按组返回应到、已清点、未清点与逐条记录。
 每次成功的编排变更都会落库一条**全局递增修订**（前后完整快照 + 逐组差异），
 供指挥员追溯"每次疏散变更为何改动编排"。
 
@@ -69,7 +74,7 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查，返回当前分钟 |
-| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、人工救援队与救援任务（旧修订保留） |
+| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、人工救援队与救援任务、先导关系及**现场清点记录**（旧修订保留） |
 | GET | `/plan` | 查询每组路线、出发/到达分钟或无法安排的原因 |
 | POST | `/groups` | 新增一组或多组，**仅重排未出发组** |
 | POST | `/group-corrections` | 批量纠正未出发组的属性（非空清单，整批原子生效）；目标组已出发则 **409 整批拒绝** |
@@ -85,6 +90,10 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/rescue-tasks` | 列出全部救援任务，可加 `?status=in_progress|completed` |
 | GET | `/rescue-tasks/{task_id}` | 查询单个任务当前状态；未知任务号 **404** |
 | POST | `/rescue-tasks/{task_id}/completion` | 结案核销（既有出口+实际送达分钟）；重复结案/送达时序冲突 **409** |
+| POST | `/headcounts` | 现场在出口按组登记一条实际撤离人数清点（幂等流水号）；未抵达/清点分钟窗口不符/累计超额 **409** |
+| POST | `/headcounts/{serial}/corrections` | 凭原流水号、原版本与非空原因把清点更正为非负人数（留痕）；版本失配/重复更正/超额 **409**，未知流水号 **404** |
+| GET | `/headcounts` | 按组返回应到、已清点、未清点人数及逐条清点记录（含更正历史） |
+| GET | `/groups/{group_id}/headcounts` | 查询单个组的清点汇总与逐条记录；未知组号 **404** |
 | POST | `/tick` | 推进当前分钟（body 可传 `{"minutes": n}`，默认 1） |
 | GET | `/passages/{edge_id}/load` | 通道逐分钟占用与各分钟有效上限，可加 `?minute=n` |
 | GET | `/revisions` | 列出全部修订（修订号/触发操作/当时分钟），重置与重启后保留 |
@@ -255,6 +264,96 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
   `DELIVERY_BEFORE_DISPATCH`、`DELIVERY_IN_FUTURE`；未知任务号 404。
 * **场景重置**（`POST /scenario`）清空全部救援队与救援任务；旧修订保留、
   修订号继续递增，重置后可重新登记同编号队伍。
+
+### 现场出口清点（登记 / 更正 / 查询）
+
+现场在出口按人群组清点实际撤离人数。**清点与更正都不改编排、不产生修订**；
+`POST /scenario` 场景重置会清空当前全部清点记录（旧修订保留）。
+
+**POST /headcounts**：请求体为
+
+```json
+{"serial": "hc-001", "group_id": 1, "exit_id": 6,
+ "count": 6, "count_minute": 4}
+```
+
+* 字段：`serial` 非空唯一流水号；`group_id`/`exit_id` 为组号与出口号；
+  `count` 为正整数人数；`count_minute` 为非负清点分钟。
+* **登记资格**：仅以下两种组可在该出口登记，否则 HTTP 409
+  `HEADCOUNT_NOT_ACCEPTABLE`（`reason=GROUP_NOT_ARRIVED`）：
+  1. **已按固定路线抵达该出口**（`scheduled`/`fixed` 且规划到达出口就是
+     所报出口，锚点为规划到达分钟，记录中 `arrival_type=planned_arrival`）；
+  2. **已由人工救援队实际送达该出口**（`rescued`，锚点取救援任务的
+     **实际出口与实际送达分钟**，规划到达字段为空时以此为准，
+     `arrival_type=actual_delivery`）。待救援（`awaiting_rescue`）、救援中
+     （`rescuing`）、未出发/失败/前置未满足的组一律不可登记。
+* **清点分钟窗口**：`count_minute` 不得早于相应到达分钟、不得晚于当前
+  分钟，否则分别 409 `COUNT_MINUTE_BEFORE_ARRIVAL` /
+  `COUNT_MINUTE_BEFORE_DELIVERY`（附 `arrival_type`/`arrival_minute`）与
+  `COUNT_MINUTE_IN_FUTURE`。
+* **流水号幂等**：同一流水号、同内容重试原样返回首条记录（HTTP 200，
+  响应 `replayed=true`，不重复登记，即使当前分钟已推进也能拿回原记录）；
+  同一流水号、异内容拒绝（409 `HEADCOUNT_CONFLICT`，响应给出已存内容）。
+* **累计上限**：同组全部记录的**当前人数**（更正后的值）累计不得超过
+  组人数，否则 409 `GROUP_COUNT_EXCEEDED`（附 `group_size`/
+  `already_counted`/`new_total`）。
+* 组或出口不存在、流水号为空、人数非正、清点分钟为负：HTTP 422。
+* 登记成功返回 HTTP 201，记录形如：
+
+```json
+{"serial": "hc-001", "group_id": 1, "exit_id": 6, "count": 6,
+ "count_minute": 4, "version": 1, "arrival_type": "planned_arrival",
+ "arrival_minute": 4, "registered_minute": 4,
+ "corrections": [], "replayed": false}
+```
+
+**POST /headcounts/{serial}/corrections**：现场可凭**原流水号、原记录
+版本与非空原因**，把一条清点更正为**非负**人数：
+
+```json
+{"version": 1, "count": 4, "reason": "重复清点2人"}
+```
+
+* 更正**保留原值与完整历史**：记录当前值覆盖为新人数，`version` +1，
+  响应与查询的 `corrections` 逐条给出 `from_version`/`to_version`/
+  `old_count`/`new_count`/`reason`/`corrected_minute`。
+* 按**更正后的同组累计数**重新检查上限（可把超额记录减记下来，为后续
+  登记腾出名额）；更正后超额返回 409
+  `HEADCOUNT_CORRECTION_NOT_ACCEPTABLE`，`reason=GROUP_COUNT_EXCEEDED`。
+* 版本失配（提交版本不是当前版本，且该版本未被消费过）为
+  `VERSION_MISMATCH`；对**同一版本重复更正**（并发双发或拿已消费版本
+  重试）为 `ALREADY_CORRECTED`，均整次拒绝、不改动记录。
+* 流水号不存在返回 404；更正为负数（422）、原因为空或纯空白（422）。
+* 更正不要求该组此刻仍在出口，也不再校验清点分钟（只改人数并留痕）。
+
+**GET /headcounts**（以及等价的 **GET /groups/{group_id}/headcounts**）
+按组编号升序返回当前场景全部组（含尚无记录的组）：
+
+```json
+{
+  "current_minute": 4,
+  "groups": [
+    {"group_id": 1, "expected_count": 10, "counted_count": 9,
+     "remaining_count": 1,
+     "records": [
+       {"serial": "hc-001", "group_id": 1, "exit_id": 6, "count": 4,
+        "count_minute": 4, "version": 2,
+        "arrival_type": "planned_arrival", "arrival_minute": 4,
+        "registered_minute": 4,
+        "corrections": [
+          {"from_version": 1, "to_version": 2, "old_count": 6,
+           "new_count": 4, "reason": "重复清点2人",
+           "corrected_minute": 4}]}]}
+  ]
+}
+```
+
+* `expected_count` 为应到（组人数）；`counted_count` 为已清点（该组全部
+  记录的当前人数之和）；`remaining_count = max(应到-已清点, 0)`。
+* 救援送达的组，其记录的 `arrival_type` 为 `actual_delivery` 且
+  `arrival_minute` 为实际送达分钟——查询与上限均以组人数为口径，
+  人工送达采用实际出口与时刻。
+* `GET /groups/{group_id}/headcounts` 查询未知组号返回 404。
 
 ### 响应（GET /plan 与所有变更接口）
 
@@ -462,7 +561,8 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 和编排变更在同一 SQLite 事务提交，查询不会看到只写入一方的状态；场景
 重置与服务重启后历史保留、编号继续递增。快照为落库时的完整编排（含当时
 固定组、救援中/已救援组状态与逐段通行时刻），按原样返回，不按当前场景
-重算。救援队登记本身不改编排，不产生修订。
+重算。救援队登记、**现场清点登记与清点更正**均不改编排，不产生修订；
+现场清点记录随场景重置清空（修订历史不受影响）。
 
 **GET /revisions**
 
@@ -584,6 +684,22 @@ curl -s -X POST http://localhost:8000/group-prerequisites \
 
 # 查询全部先导关系与实时放行依据
 curl -s http://localhost:8000/group-prerequisites | python3 -m json.tool
+
+# 现场出口清点：组1 已抵达出口6（第4分钟），清点 6 人（流水号幂等）
+curl -s -X POST http://localhost:8000/headcounts \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "hc-001", "group_id": 1, "exit_id": 6,
+       "count": 6, "count_minute": 4}' | python3 -m json.tool
+
+# 凭原流水号+原版本+非空原因把人数更正为 4（原值 6 与历史保留）
+curl -s -X POST http://localhost:8000/headcounts/hc-001/corrections \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "count": 4, "reason": "重复清点2人"}' \
+  | python3 -m json.tool
+
+# 按组查询应到/已清点/未清点与逐条记录（含更正历史）
+curl -s http://localhost:8000/headcounts | python3 -m json.tool
+curl -s http://localhost:8000/groups/1/headcounts | python3 -m json.tool
 ```
 
 ## 5. 编排语义（约定）
@@ -628,9 +744,10 @@ curl -s http://localhost:8000/group-prerequisites | python3 -m json.tool
 12. **修订**：十类变更（场景重置/新增组/纠正组/登记封闭/登记容量管制/
     登记先导关系/现场节点滞留报告/人工救援派遣/救援结案核销/推进时间）
     成功时，在同一事务内追加修订记录（全局递增修订号、触发操作、当时
-    分钟、前后完整编排快照）；被拒绝的请求不产生修订，救援队登记也不
-    产生修订。修订不随场景重置或服务重启丢失，历史快照按落库内容原样
-    返回，不按当前场景重算。
+    分钟、前后完整编排快照）；被拒绝的请求不产生修订，救援队登记、
+    **现场清点登记与清点更正**也不产生修订。修订不随场景重置或服务重启
+    丢失，历史快照按落库内容原样返回，不按当前场景重算；现场清点记录
+    随场景重置清空。
 13. **现场节点滞留报告**：仅当该组按现行计划已到达所报节点、尚未进入
     下一通道且未抵达出口时受理（下一通道进入分钟 == 当前分钟仍视为在
     节点；恢复分钟不得早于当前分钟）；组未出发、节点或时机不符一律拒绝
@@ -670,18 +787,34 @@ curl -s http://localhost:8000/group-prerequisites | python3 -m json.tool
     放行决定不追溯。成功登记在同一事务原子写入一条
     `group-prerequisites` 修订（替换时 `detail.replaced` 记录旧关系）；
     场景重置清空全部先导关系。
+16. **现场出口清点**：每条清点提交非空唯一流水号、组号、出口号、正整数
+    人数与非负清点分钟。仅已按固定路线抵达该出口（scheduled/fixed 规划
+    到达出口一致，锚点为规划到达分钟）或已由人工救援实际送达该出口
+    （rescued，锚点为救援任务的实际出口与实际送达分钟）的组可登记；
+    待救援、救援中、未出发/失败/前置未满足的组不可登记。清点分钟不得
+    早于相应到达分钟或晚于当前分钟。同一流水号同内容重试返回原记录
+    （HTTP 200、`replayed=true`，不重复登记），异内容拒绝（409
+    `HEADCOUNT_CONFLICT`）；同组全部记录的当前人数累计不得超过组人数
+    （409 `GROUP_COUNT_EXCEEDED`）。现场可凭原流水号、原记录版本与非空
+    原因把一条清点更正为非负人数：原值与历史逐条保留、版本 +1，并按
+    **更正后的同组累计数**检查上限；版本失配（`VERSION_MISMATCH`）、对
+    同一版本重复更正（`ALREADY_CORRECTED`，含并发双发的数据库层兜底）
+    或更正后超额均整次拒绝。查询按组返回应到（组人数）、已清点（全部
+    当前记录人数之和）、未清点（应到-已清点，不为负）及逐条记录（含
+    更正历史，救援送达采用实际出口与时刻）。**清点与更正不改编排、不
+    产生修订；场景重置清空当前全部清点记录（旧修订保留）。**
 
 ## 6. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、修订记录与差异
+  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、现场出口清点登记/留痕更正/按组汇总、修订记录与差异
   planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
-  db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告与修订落库
+  db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告/现场清点与修订落库
   schemas.py    Pydantic 输入/输出模型
   seed.py       启动演示数据
 examples/       curl 与 Python 调用示例
-tests/          算法单元测试与 API/并发/修订历史/先导关系集成测试（pytest）
+tests/          算法单元测试与 API/并发/修订历史/先导关系/人工救援/现场清点集成测试（pytest）
 ```
 
 本地运行测试：

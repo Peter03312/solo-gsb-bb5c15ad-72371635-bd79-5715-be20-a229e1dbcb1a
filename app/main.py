@@ -35,6 +35,16 @@
   最早出发分钟、组编号与路线并列规则。关系变更、时间推进、现场滞留及
   救援结案后立即重排未出发组，已出发组路线及既有放行决定不追溯；成功
   登记与编排修订在同一事务原子落库。
+* 现场可在出口按组清点实际撤离人数：每条提交带非空唯一流水号、组号、
+  出口号、正整数人数与非负清点分钟，仅已按固定路线抵达该出口
+  （scheduled/fixed 规划到达出口一致）或已由人工救援实际送达该出口
+  （rescued，采用救援任务的实际出口与送达分钟）的组可登记；清点分钟
+  不得早于相应到达分钟或晚于当前分钟。同流水号同内容重试幂等返回原
+  记录、异内容拒绝；同组全部记录的当前人数累计不得超过组人数。可凭原
+  流水号、原记录版本与非空原因把一条清点更正为非负人数（原值与历史
+  保留、版本 +1，按更正后的累计检查上限；版本失配、对同一版本重复
+  更正或超额均整次拒绝）。清点与更正只读写清点表，不改编排、不产生
+  修订；场景重置清空当前全部清点记录。
 
 修订历史
 ========
@@ -61,6 +71,9 @@ from .schemas import (CapacityControlIn, CapacityControlListOut,
                       CapacityControlOut, ClosureIn, ConflictOut,
                       DelayReportAliasIn, DelayReportIn, GroupChangeOut,
                       GroupCorrectionIn, GroupIn, GroupPlanOut,
+                      HeadcountCorrectionIn, HeadcountCorrectionOut,
+                      HeadcountGroupOut, HeadcountIn, HeadcountRecordOut,
+                      HeadcountRecordResultOut, HeadcountReportOut,
                       PlanResponse, PrerequisiteBasisOut, PrerequisiteIn,
                       PrerequisiteListOut, PrerequisiteOut,
                       RescueCompletionIn, RescueDispatchIn,
@@ -99,11 +112,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.4.0",
+    version="1.5.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
                 "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
                 "先导组放行间隔（多级依赖按依赖顺序安排）、"
-                "现场节点滞留报告与人工救援队交接核销。",
+                "现场节点滞留报告、人工救援队交接核销，"
+                "以及现场在出口按组清点实际撤离人数（幂等登记、留痕更正）。",
     lifespan=lifespan,
 )
 
@@ -1360,6 +1374,382 @@ async def report_group_delay_alias(payload: DelayReportAliasIn,
 class TickIn(BaseModel):
     minutes: int = Field(1, gt=0, description="推进的分钟数（正整数）")
 
+
+# --------------------------------------------------------------------------
+# 现场出口清点：登记 / 幂等重试 / 留痕更正 / 按组汇总
+# --------------------------------------------------------------------------
+
+def _headcount_conflict(reason: str, message: str,
+                        payload: HeadcountIn | dict, minute_now: int,
+                        *, extra: dict | None = None) -> JSONResponse:
+    """构造统一的清点登记拒绝响应（HTTP 409 + error/message/conflicts）。"""
+    conflict = {"serial": payload["serial"] if isinstance(payload, dict)
+                else payload.serial,
+                "group_id": payload["group_id"] if isinstance(payload, dict)
+                else payload.group_id,
+                "exit_id": payload["exit_id"] if isinstance(payload, dict)
+                else payload.exit_id,
+                "count": payload["count"] if isinstance(payload, dict)
+                else payload.count,
+                "count_minute": payload["count_minute"]
+                if isinstance(payload, dict) else payload.count_minute,
+                "current_minute": minute_now, "reason": reason}
+    if extra:
+        conflict.update(extra)
+    return JSONResponse(
+        status_code=409,
+        content={"error": "HEADCOUNT_NOT_ACCEPTABLE",
+                 "message": message, "conflicts": [conflict]})
+
+
+async def _headcount_arrival(conn: aiosqlite.Connection, group_id: int,
+                             exit_id: int):
+    """判断该组是否已以某种方式抵达（或被送达）所报出口。
+
+    返回 (arrival_type, arrival_minute)：
+    * ("planned_arrival", minute) —— 按固定路线抵达（scheduled/fixed 已有
+      规划到达，且规划出口就是所报出口）；
+    * ("actual_delivery", minute) —— 已由人工救援队结案实际送达该出口；
+    * (None, None) —— 尚未抵达（未出发/待救援/救援中/无可行路线/前置
+      未满足/抵达的是其他出口）。
+
+    是否在清点分钟"已经"到达由调用方按到达分钟与清点分钟的窗口比较
+    （早于到达时给出精确的拒绝原因）。人工实际送达优先：rescued 组的
+    规划字段保持为空，只以救援任务的实际出口与送达分钟为准；rescuing
+    （救援中、尚未送达）不可登记。
+    """
+    rescue = await db.load_group_rescue_map(conn)
+    info = rescue.get(group_id)
+    if info is not None and info["rescue_status"] == "completed":
+        if info["rescued_exit_id"] == exit_id:
+            return "actual_delivery", info["delivery_minute"]
+        return None, None
+    async with conn.execute(
+            "SELECT status, exit_id, arrival_minute FROM groups WHERE id=?",
+            (group_id,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None, None
+    status, planned_exit, arrival = row
+    if status in ("scheduled", "fixed") and planned_exit is not None \
+            and arrival is not None and planned_exit == exit_id:
+        return "planned_arrival", arrival
+    return None, None
+
+
+async def _headcount_record_out(conn: aiosqlite.Connection,
+                                rec: dict) -> HeadcountRecordResultOut:
+    """组装一条清点记录响应（附更正历史、replayed 恒 false）。"""
+    history = await db.list_headcount_corrections(conn)
+    return HeadcountRecordResultOut(
+        **rec, replayed=False,
+        corrections=[HeadcountCorrectionOut(**c)
+                     for c in history.get(rec["serial"], [])])
+
+
+async def _apply_headcount(conn: aiosqlite.Connection,
+                           payload: HeadcountIn):
+    """受理一条现场出口清点（调用方已持锁）。
+
+    同流水号同内容重试幂等返回原记录（200, replayed=true）；同流水号异
+    内容拒绝（409 HEADCOUNT_CONFLICT）。仅已按固定路线抵达该出口、或已
+    由人工救援实际送达该出口的组可登记；清点分钟须不早于相应到达分钟且
+    不晚于当前分钟；同组全部当前记录人数累计不得超过组人数。清点不改编
+    排、不产生修订。
+    """
+    minute_now = await db.get_current_minute(conn)
+
+    # 1) 同流水号重试：同内容幂等、异内容拒绝（优先于其他受理条件判定，
+    #    使迟到重试即便当前分钟已推进也能拿回原记录）
+    existing = await db.load_headcount(conn, payload.serial)
+    if existing is not None:
+        same = (existing["group_id"] == payload.group_id
+                and existing["exit_id"] == payload.exit_id
+                and existing["count"] == payload.count
+                and existing["count_minute"] == payload.count_minute)
+        if not same:
+            return _headcount_conflict(
+                "HEADCOUNT_CONFLICT",
+                "同一流水号已用于内容不同的清点，整次拒绝", payload,
+                minute_now, extra={"existing": {
+                    "group_id": existing["group_id"],
+                    "exit_id": existing["exit_id"],
+                    "count": existing["count"],
+                    "count_minute": existing["count_minute"],
+                    "version": existing["version"]}})
+        history = await db.list_headcount_corrections(conn)
+        return HeadcountRecordResultOut(
+            **existing, replayed=True,
+            corrections=[HeadcountCorrectionOut(**c)
+                         for c in history.get(payload.serial, [])])
+
+    # 2) 编号与出口有效性（422）
+    async with conn.execute("SELECT size FROM groups WHERE id=?",
+                            (payload.group_id,)) as cur:
+        group_row = await cur.fetchone()
+    if group_row is None:
+        raise HTTPException(422, f"人群组 {payload.group_id} 不存在")
+    group_size = group_row[0]
+    async with conn.execute("SELECT 1 FROM exits WHERE node_id=?",
+                            (payload.exit_id,)) as cur:
+        if await cur.fetchone() is None:
+            raise HTTPException(
+                422, f"出口 {payload.exit_id} 不是当前场景的既有出口")
+
+    # 3) 抵达资格：按固定路线抵达，或已由人工救援实际送达该出口
+    arrival_type, arrival_minute = await _headcount_arrival(
+        conn, payload.group_id, payload.exit_id)
+    if arrival_type is None:
+        return _headcount_conflict(
+            "GROUP_NOT_ARRIVED",
+            "该组尚未按固定路线抵达该出口，也未由人工救援实际送达，"
+            "清点不受理，整次拒绝", payload, minute_now)
+
+    # 4) 清点分钟窗口：不早于相应到达分钟，不晚于当前分钟
+    if payload.count_minute < arrival_minute:
+        reason_code = ("COUNT_MINUTE_BEFORE_ARRIVAL"
+                      if arrival_type == "planned_arrival"
+                      else "COUNT_MINUTE_BEFORE_DELIVERY")
+        return _headcount_conflict(
+            reason_code,
+            "清点分钟早于该组相应到达分钟，整次拒绝", payload, minute_now,
+            extra={"arrival_type": arrival_type,
+                   "arrival_minute": arrival_minute})
+    if payload.count_minute > minute_now:
+        return _headcount_conflict(
+            "COUNT_MINUTE_IN_FUTURE",
+            "清点分钟晚于当前分钟，整次拒绝", payload, minute_now)
+
+    # 5) 同组累计人数不得超过组人数（按各条记录的当前人数，更正已计入）
+    group_records = await db.list_headcounts(conn, payload.group_id)
+    counted = sum(r["count"] for r in group_records)
+    if counted + payload.count > group_size:
+        return _headcount_conflict(
+            "GROUP_COUNT_EXCEEDED",
+            "该组累计清点人数将超过组人数，整次拒绝", payload, minute_now,
+            extra={"group_size": group_size,
+                   "already_counted": counted,
+                   "new_total": counted + payload.count})
+
+    async with db.transaction(conn):
+        await db.insert_headcount(
+            conn, serial=payload.serial, group_id=payload.group_id,
+            exit_id=payload.exit_id, count=payload.count,
+            count_minute=payload.count_minute,
+            arrival_type=arrival_type, arrival_minute=arrival_minute,
+            registered_minute=minute_now)
+        rec = await db.load_headcount(conn, payload.serial)
+    return await _headcount_record_out(conn, rec)
+
+
+async def _apply_headcount_correction(conn: aiosqlite.Connection,
+                                      serial: str,
+                                      payload: HeadcountCorrectionIn):
+    """凭原流水号、原记录版本与非空原因更正一条清点（调用方已持锁）。
+
+    更正为非负人数，原值与历史逐条保留，版本 +1；按更正后的同组累计数
+    检查上限。版本失配、对同一版本重复更正或超额均整次拒绝。更正不改编
+    排、不产生修订。
+    """
+    minute_now = await db.get_current_minute(conn)
+    if not payload.reason.strip():
+        raise HTTPException(422, "更正原因不能为空（纯空白同样拒绝）")
+    rec = await db.load_headcount(conn, serial)
+    if rec is None:
+        raise HTTPException(404, f"清点流水号 {serial} 不存在")
+
+    def _conflict(reason: str, message: str, extra: dict) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "HEADCOUNT_CORRECTION_NOT_ACCEPTABLE",
+                "message": message,
+                "conflicts": [{
+                    "serial": serial, "group_id": rec["group_id"],
+                    "exit_id": rec["exit_id"],
+                    "submitted_version": payload.version,
+                    "current_version": rec["version"],
+                    "current_count": rec["count"],
+                    "new_count": payload.count,
+                    "current_minute": minute_now,
+                    "reason": reason, **extra}]})
+
+    # 对同一版本重复更正：该版本已被一次更正消费（历史中存在
+    # from_version）。此检查先于版本失配，使两个持同一旧版本的并发请求
+    # 在一个成功后，另一个得到明确的"重复更正"而非笼统的版本失配。
+    history = await db.list_headcount_corrections(conn)
+    already = [c for c in history.get(serial, [])
+               if c["from_version"] == payload.version]
+    if already:
+        return _conflict(
+            "ALREADY_CORRECTED",
+            "该记录版本已被更正，不可对同一版本重复更正，整次拒绝",
+            {"corrected_to_version": already[-1]["to_version"],
+             "previous_reason": already[-1]["reason"]})
+
+    # 版本失配：客户端所持不是当前版本
+    if payload.version != rec["version"]:
+        return _conflict(
+            "VERSION_MISMATCH",
+            "提交的原记录版本与当前版本不符，整次拒绝", {})
+
+    # 按更正后的累计数检查上限（其他记录按其当前人数）
+    async with conn.execute("SELECT size FROM groups WHERE id=?",
+                            (rec["group_id"],)) as cur:
+        group_size = (await cur.fetchone())[0]
+    group_records = await db.list_headcounts(conn, rec["group_id"])
+    counted = sum(r["count"] for r in group_records
+                  if r["serial"] != serial) + payload.count
+    if counted > group_size:
+        return _conflict(
+            "GROUP_COUNT_EXCEEDED",
+            "更正后该组累计清点人数将超过组人数，整次拒绝",
+            {"group_size": group_size,
+             "other_records_counted":
+                 sum(r["count"] for r in group_records
+                     if r["serial"] != serial),
+             "new_total": counted})
+
+    new_version = rec["version"] + 1
+    async with db.transaction(conn):
+        try:
+            await db.apply_headcount_correction(
+                conn, serial=serial, from_version=payload.version,
+                to_version=new_version, old_count=rec["count"],
+                new_count=payload.count, reason=payload.reason,
+                corrected_minute=minute_now)
+        except aiosqlite.IntegrityError:
+            # 并发抢占的数据库层兜底：同 (serial, from_version) 已更正
+            return _conflict(
+                "ALREADY_CORRECTED",
+                "该记录版本已被更正，不可对同一版本重复更正，整次拒绝",
+                {})
+        rec = await db.load_headcount(conn, serial)
+    return await _headcount_record_out(conn, rec)
+
+
+async def _build_headcount_report(conn: aiosqlite.Connection,
+                                  group_id: int | None = None
+                                  ) -> HeadcountReportOut:
+    """按组汇总清点：应到、已清点、未清点及逐条记录（含更正历史）。"""
+    minute_now = await db.get_current_minute(conn)
+    async with conn.execute(
+            "SELECT id, size FROM groups ORDER BY id") as cur:
+        group_rows = await cur.fetchall()
+    records = await db.list_headcounts(conn, group_id)
+    history = await db.list_headcount_corrections(conn)
+    by_group: dict[int, list[HeadcountRecordOut]] = {}
+    for r in records:
+        by_group.setdefault(r["group_id"], []).append(HeadcountRecordOut(
+            **r, corrections=[HeadcountCorrectionOut(**c)
+                              for c in history.get(r["serial"], [])]))
+    groups = []
+    for gid, size in group_rows:
+        if group_id is not None and gid != group_id:
+            continue
+        recs = by_group.get(gid, [])
+        counted = sum(r.count for r in recs)
+        groups.append(HeadcountGroupOut(
+            group_id=gid, expected_count=size, counted_count=counted,
+            remaining_count=max(size - counted, 0), records=recs))
+    return HeadcountReportOut(current_minute=minute_now, groups=groups)
+
+
+@app.post("/headcounts", tags=["现场清点"],
+          response_model=HeadcountRecordResultOut, status_code=201,
+          responses={
+              200: {"description": "同流水号同内容重试，幂等返回原记录"
+                          "（replayed=true）"},
+              409: {"description": "未抵达该出口/清点分钟窗口不符/累计超额/"
+                                   "同流水号异内容，整次拒绝"},
+              422: {"description": "组或出口不存在、人数非正、流水号为空等"}})
+async def submit_headcount(payload: HeadcountIn, request: Request):
+    """现场在出口按人群组登记一条实际撤离人数清点。
+
+    请求体给出非空唯一流水号、组号、出口号、正整数人数与非负清点分钟。
+    仅**已按固定路线抵达该出口**（``scheduled``/``fixed`` 且规划到达
+    出口一致），或**已由人工救援队实际送达该出口**（``rescued``，采用
+    救援任务的实际出口与送达分钟）的组可登记；清点分钟不得早于相应到达
+    分钟（``COUNT_MINUTE_BEFORE_ARRIVAL`` /
+    ``COUNT_MINUTE_BEFORE_DELIVERY``）且不得晚于当前分钟
+    （``COUNT_MINUTE_IN_FUTURE``）。
+
+    * 同流水号、同内容重试：返回原记录（HTTP 200，``replayed=true``），
+      不重复登记、不改编排；
+    * 同流水号、异内容：HTTP 409 ``HEADCOUNT_CONFLICT`` 整次拒绝；
+    * 同组全部记录的当前人数累计不得超过组人数，否则 409
+      ``GROUP_COUNT_EXCEEDED``（附组人数/已清点/累计）；
+    * 组或出口不存在、流水号为空、人数非正、清点分钟为负：422。
+
+    清点不改变编排与修订；场景重置清空当前全部清点记录。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        result = await _apply_headcount(conn, payload)
+    if isinstance(result, HeadcountRecordResultOut):
+        if result.replayed:
+            # 同流水号同内容重试：幂等返回原记录，HTTP 200（非新登记）
+            return JSONResponse(status_code=200,
+                                content=result.model_dump(mode="json"))
+        return result
+    return result
+
+
+@app.post("/headcounts/{serial}/corrections", tags=["现场清点"],
+          response_model=HeadcountRecordResultOut,
+          responses={
+              409: {"description": "版本失配/同一版本重复更正/更正后累计"
+                                   "超额，整次拒绝"},
+              404: {"description": "清点流水号不存在"}})
+async def correct_headcount(serial: str, payload: HeadcountCorrectionIn,
+                            request: Request):
+    """凭原流水号、原记录版本与非空原因，将一条清点更正为非负人数。
+
+    更正保留原值与完整历史（``corrections`` 逐条给出原版本/新版本/原值/
+    新值/原因），记录版本 +1，并按**更正后的同组累计数**检查上限。
+    版本失配（``VERSION_MISMATCH``）、对同一版本重复更正
+    （``ALREADY_CORRECTED``）或更正后超额（``GROUP_COUNT_EXCEEDED``）均
+    整次拒绝；流水号不存在返回 404；原因为空（含纯空白）返回 422。
+    更正不改编排、不产生修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        result = await _apply_headcount_correction(conn, serial, payload)
+    if isinstance(result, HeadcountRecordResultOut):
+        return result
+    return result
+
+
+@app.get("/headcounts", tags=["现场清点"],
+         response_model=HeadcountReportOut)
+async def list_headcounts(request: Request):
+    """按组返回清点汇总：应到（组人数）、已清点（全部当前记录人数之和）、
+    未清点（应到-已清点，不为负）及逐条清点记录（含更正历史）。
+
+    按组编号升序返回当前场景的全部组（含尚无清点记录的组）。
+    """
+    async with request.app.state.lock:
+        return await _build_headcount_report(request.app.state.db)
+
+
+@app.get("/groups/{group_id}/headcounts", tags=["现场清点"],
+         response_model=HeadcountReportOut,
+         responses={404: {"description": "人群组不存在"}})
+async def list_group_headcounts(group_id: int, request: Request):
+    """查询单个组的清点汇总与逐条记录（语义同 GET /headcounts 中的该组）；
+    未知组号返回 404。"""
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        async with conn.execute("SELECT 1 FROM groups WHERE id=?",
+                                (group_id,)) as cur:
+            if await cur.fetchone() is None:
+                raise HTTPException(404, f"人群组 {group_id} 不存在")
+        return await _build_headcount_report(conn, group_id)
+
+
+# --------------------------------------------------------------------------
+# 时间推进
+# --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
 # 人工救援队：登记 / 派遣 / 查询 / 结案核销

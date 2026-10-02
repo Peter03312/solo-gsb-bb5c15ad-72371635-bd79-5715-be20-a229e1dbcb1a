@@ -119,6 +119,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_rescue_tasks_open_group
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rescue_tasks_open_team
     ON rescue_tasks(team_id) WHERE status='in_progress';
 
+-- 现场出口清点：每条提交以非空流水号为唯一键。count 为该条的当前人数
+-- （更正后覆盖，原值在 headcount_corrections 保留），version 从 1 起、
+-- 每次成功更正 +1。arrival_type 标记到达依据：
+-- planned_arrival=按固定路线抵达；actual_delivery=人工救援队实际送达；
+-- arrival_minute 为登记时采用的相应到达分钟（规划到达/实际送达）。
+CREATE TABLE IF NOT EXISTS headcounts (
+    serial            TEXT PRIMARY KEY,
+    group_id          INTEGER NOT NULL,
+    exit_id           INTEGER NOT NULL,
+    count             INTEGER NOT NULL,
+    count_minute      INTEGER NOT NULL,
+    version           INTEGER NOT NULL,
+    arrival_type      TEXT NOT NULL,
+    arrival_minute    INTEGER NOT NULL,
+    registered_minute INTEGER NOT NULL
+);
+
+-- 清点更正历史：每次成功更正一行，保留原值（old_count）与非空原因。
+-- (serial, from_version) 唯一：对同一记录版本的重复更正由数据库层兜底拒绝。
+CREATE TABLE IF NOT EXISTS headcount_corrections (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    serial           TEXT NOT NULL,
+    from_version     INTEGER NOT NULL,
+    to_version       INTEGER NOT NULL,
+    old_count        INTEGER NOT NULL,
+    new_count        INTEGER NOT NULL,
+    reason           TEXT NOT NULL,
+    corrected_minute INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_headcount_corr_version
+    ON headcount_corrections(serial, from_version);
+
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
 -- 登记容量管制/现场节点滞留报告/推进时间）与编排变更在同一事务内写入；
 -- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
@@ -151,9 +183,10 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
     修订号继续全局递增。
     """
-    # 人工救援队与其救援任务随场景重置清空；先导关系亦清空；修订历史不在
-    # 清空之列
-    for table in ("rescue_tasks", "rescue_teams",
+    # 人工救援队与其救援任务随场景重置清空；先导关系、现场清点记录亦清空；
+    # 修订历史不在清空之列
+    for table in ("headcount_corrections", "headcounts",
+                  "rescue_tasks", "rescue_teams",
                   "delay_reports", "group_prerequisites",
                   "route_steps", "groups", "closures",
                   "capacity_controls", "exits", "edges", "meta"):
@@ -527,6 +560,99 @@ async def load_group_rescue_map(db: aiosqlite.Connection) -> dict[int, dict]:
                  "rescued_exit_id": row[4],
                  "delivery_minute": row[5]}
         for row in rows}
+
+
+# --------------------------------------------------------------------------
+# 现场出口清点
+# --------------------------------------------------------------------------
+
+async def insert_headcount(db: aiosqlite.Connection, *, serial: str,
+                           group_id: int, exit_id: int, count: int,
+                           count_minute: int, arrival_type: str,
+                           arrival_minute: int,
+                           registered_minute: int) -> None:
+    """登记一条出口清点（调用方负责事务与全部受理校验，version 初始为 1）。"""
+    await db.execute(
+        """INSERT INTO headcounts(serial, group_id, exit_id, count,
+                                  count_minute, version, arrival_type,
+                                  arrival_minute, registered_minute)
+           VALUES(?,?,?,?,?,1,?,?,?)""",
+        (serial, group_id, exit_id, count, count_minute, arrival_type,
+         arrival_minute, registered_minute))
+
+
+async def load_headcount(db: aiosqlite.Connection,
+                         serial: str) -> dict | None:
+    async with db.execute(
+            """SELECT serial, group_id, exit_id, count, count_minute,
+                      version, arrival_type, arrival_minute,
+                      registered_minute
+               FROM headcounts WHERE serial=?""", (serial,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"serial": row[0], "group_id": row[1], "exit_id": row[2],
+            "count": row[3], "count_minute": row[4], "version": row[5],
+            "arrival_type": row[6], "arrival_minute": row[7],
+            "registered_minute": row[8]}
+
+
+async def list_headcounts(db: aiosqlite.Connection,
+                          group_id: int | None = None) -> list[dict]:
+    """按登记（流水号）顺序列出现有清点记录，可按组过滤。"""
+    if group_id is None:
+        query = ("SELECT serial, group_id, exit_id, count, count_minute, "
+                 "version, arrival_type, arrival_minute, "
+                 "registered_minute FROM headcounts ORDER BY rowid")
+        params: tuple = ()
+    else:
+        query = ("SELECT serial, group_id, exit_id, count, count_minute, "
+                 "version, arrival_type, arrival_minute, "
+                 "registered_minute FROM headcounts WHERE group_id=? "
+                 "ORDER BY rowid")
+        params = (group_id,)
+    async with db.execute(query, params) as cur:
+        rows = await cur.fetchall()
+    return [{"serial": r[0], "group_id": r[1], "exit_id": r[2],
+             "count": r[3], "count_minute": r[4], "version": r[5],
+             "arrival_type": r[6], "arrival_minute": r[7],
+             "registered_minute": r[8]}
+            for r in rows]
+
+
+async def list_headcount_corrections(db: aiosqlite.Connection
+                                     ) -> dict[str, list[dict]]:
+    """返回 serial -> 更正历史（按更正发生顺序）。"""
+    async with db.execute(
+            """SELECT serial, from_version, to_version, old_count,
+                      new_count, reason, corrected_minute
+               FROM headcount_corrections ORDER BY id""") as cur:
+        rows = await cur.fetchall()
+    history: dict[str, list[dict]] = {}
+    for serial, fv, tv, old, new, reason, minute in rows:
+        history.setdefault(serial, []).append(
+            {"from_version": fv, "to_version": tv, "old_count": old,
+             "new_count": new, "reason": reason,
+             "corrected_minute": minute})
+    return history
+
+
+async def apply_headcount_correction(db: aiosqlite.Connection, *,
+                                     serial: str, from_version: int,
+                                     to_version: int, old_count: int,
+                                     new_count: int, reason: str,
+                                     corrected_minute: int) -> None:
+    """应用一次清点更正（调用方负责事务与全部校验）：覆盖当前值并留痕。"""
+    await db.execute(
+        """INSERT INTO headcount_corrections(serial, from_version, to_version,
+                                             old_count, new_count, reason,
+                                             corrected_minute)
+           VALUES(?,?,?,?,?,?,?)""",
+        (serial, from_version, to_version, old_count, new_count, reason,
+         corrected_minute))
+    await db.execute(
+        "UPDATE headcounts SET count=?, version=? WHERE serial=?",
+        (new_count, to_version, serial))
 
 
 # --------------------------------------------------------------------------
