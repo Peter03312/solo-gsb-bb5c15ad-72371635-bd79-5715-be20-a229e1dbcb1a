@@ -20,6 +20,11 @@
 先导已人工送达时改用实际送达分钟；先导待救援、救援中或无可行路线时后继
 
 标记**前置未满足**（不占通道），多级关系按依赖顺序安排。
+支持现场在出口按人群组**清点实际撤离人数**：每条清点凭非空唯一流水号
+幂等登记（同内容重试返回原记录、异内容拒绝），仅已按固定路线抵达该出口
+或已由人工救援实际送达该出口的组可登记，同组累计不超组人数；可凭原
+流水号、记录版本与非空原因**更正**为非负人数（保留原值与更正历史），
+并按组查询应到/已清点/未清点人数与逐条记录。
 每次成功的编排变更都会落库一条**全局递增修订**（前后完整快照 + 逐组差异），
 供指挥员追溯"每次疏散变更为何改动编排"。
 
@@ -69,7 +74,7 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查，返回当前分钟 |
-| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、人工救援队与救援任务（旧修订保留） |
+| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、人工救援队与救援任务、先导关系与出口清点记录（旧修订保留） |
 | GET | `/plan` | 查询每组路线、出发/到达分钟或无法安排的原因 |
 | POST | `/groups` | 新增一组或多组，**仅重排未出发组** |
 | POST | `/group-corrections` | 批量纠正未出发组的属性（非空清单，整批原子生效）；目标组已出发则 **409 整批拒绝** |
@@ -85,6 +90,10 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/rescue-tasks` | 列出全部救援任务，可加 `?status=in_progress|completed` |
 | GET | `/rescue-tasks/{task_id}` | 查询单个任务当前状态；未知任务号 **404** |
 | POST | `/rescue-tasks/{task_id}/completion` | 结案核销（既有出口+实际送达分钟）；重复结案/送达时序冲突 **409** |
+| POST | `/exit-counts` | 登记一条出口清点（非空唯一流水号幂等）；同内容重试返回原记录，异内容/组未抵达/出口不符/分钟越窗/累计超额 **409**，参数或编号无效 **422** |
+| POST | `/exit-counts/{serial}/correction` | 凭原流水号+记录版本+非空原因更正为非负人数（保留原值与历史）；版本失配/重复更正/超额 **409**，未知流水号 **404** |
+| GET | `/exit-counts` | 按组列出应到/已清点/未清点人数及逐条记录（含更正历史） |
+| GET | `/exit-counts/{group_id}` | 单组清点台账；未知组号 **404** |
 | POST | `/tick` | 推进当前分钟（body 可传 `{"minutes": n}`，默认 1） |
 | GET | `/passages/{edge_id}/load` | 通道逐分钟占用与各分钟有效上限，可加 `?minute=n` |
 | GET | `/revisions` | 列出全部修订（修订号/触发操作/当时分钟），重置与重启后保留 |
@@ -255,6 +264,84 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
   `DELIVERY_BEFORE_DISPATCH`、`DELIVERY_IN_FUTURE`；未知任务号 404。
 * **场景重置**（`POST /scenario`）清空全部救援队与救援任务；旧修订保留、
   修订号继续递增，重置后可重新登记同编号队伍。
+
+**出口清点（按组清点实际撤离人数）**
+
+* `POST /exit-counts` 登记一条清点：
+
+  ```json
+  {"serial": "C-0001", "group_id": 1, "exit_id": 6,
+   "count": 4, "counted_minute": 2}
+  ```
+
+  * `serial`：**非空**唯一流水号（幂等键）；`count` 为**正整数**人数；
+    `counted_minute` 为**非负**清点分钟（非法取值 422）。
+  * **仅**已按固定路线抵达该出口（`fixed` 且到达分钟不晚于当前分钟）或
+    已由人工救援实际送达该出口（`rescued`）的组可登记；救援送达组采用
+    **实际出口与实际送达分钟**作为到达锚点。清点分钟不得早于相应到达/
+    送达分钟，也不得晚于当前分钟。
+  * 组不存在、出口非当前场景既有出口返回 422。
+  * **幂等**：同一流水号**同内容**（组号/出口号/人数/清点分钟均一致）
+    重试返回 HTTP 200 与原记录，不产生重复记录；**异内容**返回 409
+    `EXIT_COUNT_SERIAL_CONFLICT`（`reason=SERIAL_CONTENT_MISMATCH`，
+    附已登记内容），整次拒绝。
+  * **累计上限**：同组全部记录的当前生效人数之和不得超过组人数，超额
+    整次拒绝（409，`reason=COUNT_EXCEEDS_GROUP_SIZE`，附组人数、已清点
+    累计与本次提交人数）。
+  * 其余 409 拒绝（`EXIT_COUNT_NOT_ACCEPTABLE`，`conflicts[0].reason`
+    区分）：`GROUP_NOT_ARRIVED`（组尚未抵达任何出口）、`EXIT_MISMATCH`
+    （清点出口与抵达/送达出口不符，附 `expected_exit_id`）、
+    `COUNTED_MINUTE_BEFORE_ARRIVAL`（清点分钟早于到达/送达分钟，附
+    `arrival_minute`）、`COUNTED_MINUTE_IN_FUTURE`（清点分钟晚于当前
+    分钟）。任何拒绝均不登记记录、不产生修订。
+  * 首次登记成功返回 HTTP 201 与记录（版本自 1 起）；**登记不改编排、
+    不产生修订**。
+* `POST /exit-counts/{serial}/correction` 更正一条清点：
+
+  ```json
+  {"version": 1, "count": 3, "reason": "复核实为 3 人"}
+  ```
+
+  * 凭**原流水号**、**原记录版本**（须为记录当前版本）与**非空原因**
+    把人数更正为**非负**整数；更正保留原值与历史——记录内
+    `submitted_count` 恒为首次提交人数，每次更正追加一条历史（原值、
+    新值、原因与受理分钟），记录版本 +1。
+  * 按更正后的同组累计数复核组人数上限。版本失配
+    （`VERSION_MISMATCH`）、对同一版本重复更正
+    （`VERSION_ALREADY_CORRECTED`，提交版本小于当前版本）或更正后累计
+    超额（`COUNT_EXCEEDS_GROUP_SIZE`）均整次拒绝（409
+    `EXIT_COUNT_CORRECTION_NOT_ACCEPTABLE`），记录与历史不变；未知
+    流水号 404；空原因/负人数/非法版本 422。成功返回 HTTP 200 与更新后
+    记录；**更正不改编排、不产生修订**。
+* `GET /exit-counts/{group_id}` 按组查询清点台账（未知组号 404），
+  `GET /exit-counts` 汇总全部组：
+
+  ```json
+  {
+    "current_minute": 3,
+    "group_id": 1,
+    "expected": 10,
+    "counted": 3,
+    "remaining": 7,
+    "arrival": {"basis": "planned_arrival", "exit_id": 6, "minute": 2},
+    "records": [
+      {"serial": "C-0001", "group_id": 1, "exit_id": 6, "count": 3,
+       "submitted_count": 4, "counted_minute": 2, "version": 2,
+       "created_minute": 3,
+       "corrections": [
+         {"from_version": 1, "to_version": 2, "old_count": 4,
+          "new_count": 3, "reason": "复核实为 3 人", "minute": 3}]}
+    ]
+  }
+  ```
+
+  * `expected`/`counted`/`remaining`：应到（组人数）、已清点（全部记录
+    当前生效人数之和）、未清点人数。
+  * `arrival` 为可清点到达锚点：`planned_arrival`（按固定路线抵达的
+    规划出口与分钟）或 `actual_delivery`（人工救援**实际送达**的出口与
+    分钟）；尚未抵达的组三个字段均为 `null`。
+* **场景重置**（`POST /scenario`）清空全部清点记录与更正历史；旧修订
+  保留，流水号可在新场景重新使用。
 
 ### 响应（GET /plan 与所有变更接口）
 
@@ -462,7 +549,7 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 和编排变更在同一 SQLite 事务提交，查询不会看到只写入一方的状态；场景
 重置与服务重启后历史保留、编号继续递增。快照为落库时的完整编排（含当时
 固定组、救援中/已救援组状态与逐段通行时刻），按原样返回，不按当前场景
-重算。救援队登记本身不改编排，不产生修订。
+重算。救援队登记与**出口清点/清点更正**均不改编排，不产生修订。
 
 **GET /revisions**
 
@@ -529,7 +616,8 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 # curl 版（依次演示初始化、新增组、新增封闭、推进分钟、409 拒绝、
-# 容量管制登记/重叠/超载拒绝、有效上限核验、修订追溯）
+# 容量管制登记/重叠/超载拒绝、有效上限核验、现场滞留报告、人工救援
+# 派遣/结案、先导关系、出口清点登记/幂等/更正/查询、修订追溯）
 bash examples/curl_examples.sh
 
 # Python 版（仅标准库）
@@ -584,6 +672,21 @@ curl -s -X POST http://localhost:8000/group-prerequisites \
 
 # 查询全部先导关系与实时放行依据
 curl -s http://localhost:8000/group-prerequisites | python3 -m json.tool
+
+# 出口清点：组1 已按固定路线抵达出口6（到达分钟2，当前分钟3），清点 4 人
+curl -s -X POST http://localhost:8000/exit-counts \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-0001", "group_id": 1, "exit_id": 6,
+       "count": 4, "counted_minute": 2}' | python3 -m json.tool
+
+# 凭流水号+版本+原因更正为 3 人（保留原值与更正历史）
+curl -s -X POST http://localhost:8000/exit-counts/C-0001/correction \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "count": 3, "reason": "复核实为 3 人"}' \
+  | python3 -m json.tool
+
+# 按组查询清点台账：应到/已清点/未清点与逐条记录
+curl -s http://localhost:8000/exit-counts/1 | python3 -m json.tool
 ```
 
 ## 5. 编排语义（约定）
@@ -670,18 +773,29 @@ curl -s http://localhost:8000/group-prerequisites | python3 -m json.tool
     放行决定不追溯。成功登记在同一事务原子写入一条
     `group-prerequisites` 修订（替换时 `detail.replaced` 记录旧关系）；
     场景重置清空全部先导关系。
+16. **出口清点**：现场在出口按组清点实际撤离人数。每条清点凭非空唯一
+    流水号幂等登记：同内容重试返回原记录（HTTP 200），异内容整次拒绝
+    （409）；仅已按固定路线抵达该出口（`fixed` 且到达分钟不晚于当前
+    分钟）或已由人工救援实际送达该出口（`rescued`，采用实际出口与实际
+    送达分钟）的组可登记；清点分钟不得早于相应到达/送达分钟、不得晚于
+    当前分钟；同组累计人数不得超过组人数（登记与更正均按更正后口径
+    复核）。更正凭原流水号、记录当前版本与非空原因把人数更正为非负
+    整数：保留原值与更正历史（`submitted_count` 恒为首次提交人数，
+    每次更正追加一条历史并使版本 +1）；版本失配、对同一版本重复更正
+    或更正后累计超额均整次拒绝（409），记录与历史不变。清点与更正
+    不改编排、不产生修订；场景重置清空全部清点记录与更正历史。
 
 ## 6. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、修订记录与差异
+  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、出口清点登记/更正/查询、修订记录与差异
   planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
-  db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告与修订落库
+  db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告/出口清点与修订落库
   schemas.py    Pydantic 输入/输出模型
   seed.py       启动演示数据
 examples/       curl 与 Python 调用示例
-tests/          算法单元测试与 API/并发/修订历史/先导关系集成测试（pytest）
+tests/          算法单元测试与 API/并发/修订历史/先导关系/出口清点集成测试（pytest）
 ```
 
 本地运行测试：

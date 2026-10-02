@@ -4,7 +4,8 @@
 # 依次演示：初始化、新增组、新增封闭、推进分钟、409 拒绝、容量管制登记/
 # 重叠/超载拒绝、有效上限核验、组纠正、现场节点滞留报告（受理/拒绝/待救援）、
 # 人工救援队登记/派遣拒绝/派遣受理/结案核销、先导关系登记/替换/拒绝/前置
-# 未满足/多级依赖/人工送达锚点、修订追溯。
+# 未满足/多级依赖/人工送达锚点、出口清点（幂等登记/拒绝/更正/查询）、
+# 修订追溯。
 set -euo pipefail
 
 BASE="${1:-${BASE:-http://localhost:8000}}"
@@ -385,5 +386,126 @@ curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
 curl -s -X POST "$BASE/rescue-tasks/$TASK_ID/completion" -H 'Content-Type: application/json' \
   -d '{"exit_id": 6, "delivery_minute": 9}' | python3 -m json.tool
 curl -s "$BASE/plan" | python3 -m json.tool
+
+# ---- 出口清点：按组清点实际撤离人数（幂等登记 / 版本化更正 / 按组查询）----
+say "52) 重置为清点演示场景：组1(10人) t=0 出发、t=2 抵达出口6；组2(5人) 尚未出发；推进到第3分钟"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 6, "minutes": 2, "capacity": 20}
+    ],
+    "exits": [5, 6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30},
+      {"id": 2, "size": 5, "origin": 1, "earliest_departure": 10, "priority": 5, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 3}' > /dev/null
+curl -s "$BASE/plan" | python3 -m json.tool
+
+say "53) 登记校验：未抵达组 409 GROUP_NOT_ARRIVED；出口不符 409 EXIT_MISMATCH；分钟越窗 409"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/exit-counts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-NA", "group_id": 2, "exit_id": 6, "count": 1, "counted_minute": 3}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/exit-counts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-EX", "group_id": 1, "exit_id": 5, "count": 1, "counted_minute": 2}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/exit-counts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-TM", "group_id": 1, "exit_id": 6, "count": 1, "counted_minute": 1}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "54) 正式登记：流水号 C-0001，组1 在出口6 第2分钟清点 4 人（HTTP 201）"
+curl -s -X POST "$BASE/exit-counts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-0001", "group_id": 1, "exit_id": 6, "count": 4, "counted_minute": 2}' \
+  | python3 -m json.tool
+
+say "55) 幂等：同流水号同内容重试 -> HTTP 200 返回原记录；异内容 -> HTTP 409 整次拒绝"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/exit-counts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-0001", "group_id": 1, "exit_id": 6, "count": 4, "counted_minute": 2}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/exit-counts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-0001", "group_id": 1, "exit_id": 6, "count": 5, "counted_minute": 2}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "56) 累计上限：组1 共10人已清点4，再登记7人 -> 409 COUNT_EXCEEDS_GROUP_SIZE；登记6人成功"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/exit-counts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-0002", "group_id": 1, "exit_id": 6, "count": 7, "counted_minute": 3}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -X POST "$BASE/exit-counts" \
+  -H 'Content-Type: application/json' \
+  -d '{"serial": "C-0002", "group_id": 1, "exit_id": 6, "count": 6, "counted_minute": 3}' \
+  | python3 -m json.tool
+
+say "57) 更正：凭流水号+版本1+非空原因把 C-0001 更正为 3 人（保留原值与历史）"
+curl -s -X POST "$BASE/exit-counts/C-0001/correction" \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "count": 3, "reason": "复核实为 3 人"}' | python3 -m json.tool
+
+say "58) 更正校验：对同一版本重复更正 -> 409 VERSION_ALREADY_CORRECTED；版本失配 -> 409 VERSION_MISMATCH"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/exit-counts/C-0001/correction" \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "count": 2, "reason": "重复更正"}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/exit-counts/C-0001/correction" \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 9, "count": 2, "reason": "版本失配"}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "59) 按组查询清点台账：应到/已清点/未清点与逐条记录（含更正历史）"
+curl -s "$BASE/exit-counts/1" | python3 -m json.tool
+curl -s "$BASE/exit-counts" | python3 -m json.tool
+
+say "60) 救援送达组按实际出口与时刻清点：待救援场景 + 派遣 + 结案（出口6、送达4）"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+      {"id": 2, "src": 2, "dst": 6, "minutes": 1, "capacity": 10}
+    ],
+    "exits": [5, 6],
+    "closures": [{"edge_id": 2, "start_minute": 5, "end_minute": 30}],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' \
+  -d '{"minutes": 4}' > /dev/null
+curl -s -X POST "$BASE/groups/1/delay-report" -H 'Content-Type: application/json' \
+  -d '{"node_id": 2, "recovery_minute": 6}' > /dev/null
+curl -s -X POST "$BASE/rescue-teams" -H 'Content-Type: application/json' \
+  -d '{"team_id": 1, "capacity": 10}' > /dev/null
+curl -s -X POST "$BASE/rescue-tasks" -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "team_id": 1, "node_id": 2, "observed_minute": 4}' > /tmp/dispatch.json
+TASK_ID=$(python3 -c 'import json; print(json.load(open("/tmp/dispatch.json"))["task_id"])')
+curl -s -X POST "$BASE/rescue-tasks/$TASK_ID/completion" -H 'Content-Type: application/json' \
+  -d '{"exit_id": 6, "delivery_minute": 4}' > /dev/null
+curl -s -X POST "$BASE/exit-counts" -H 'Content-Type: application/json' \
+  -d '{"serial": "C-1001", "group_id": 1, "exit_id": 6, "count": 10, "counted_minute": 4}' \
+  | python3 -m json.tool
+curl -s "$BASE/exit-counts/1" | python3 -m json.tool
+
+say "61) 场景重置清空全部清点记录（组1 台账归零、流水号可复用）"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [{"id": 1, "src": 1, "dst": 6, "minutes": 2, "capacity": 20}],
+    "exits": [6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s "$BASE/exit-counts" | python3 -m json.tool
 
 say "完成。交互文档： $BASE/docs"

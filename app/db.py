@@ -119,6 +119,36 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_rescue_tasks_open_group
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rescue_tasks_open_team
     ON rescue_tasks(team_id) WHERE status='in_progress';
 
+-- 出口清点记录：现场在出口按组清点的实际撤离人数。serial 为全库唯一
+-- 流水号（幂等键）：同内容重试返回原记录，异内容拒绝。submitted_count 为
+-- 首次提交人数（幂等比对用，不随更正改变）；counted 为当前生效人数
+-- （更正后更新）；version 自 1 起，每次更正 +1。
+CREATE TABLE IF NOT EXISTS exit_counts (
+    serial          TEXT PRIMARY KEY,
+    group_id        INTEGER NOT NULL,
+    exit_id         INTEGER NOT NULL,
+    submitted_count INTEGER NOT NULL,
+    counted         INTEGER NOT NULL,
+    counted_minute  INTEGER NOT NULL,
+    version         INTEGER NOT NULL,
+    created_minute  INTEGER NOT NULL
+);
+
+-- 清点更正历史：每次更正追加一条（保留原值与新值、非空原因与受理分钟），
+-- 记录本身只更新生效人数与版本，历史永不改写。
+CREATE TABLE IF NOT EXISTS exit_count_corrections (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    serial       TEXT NOT NULL,
+    from_version INTEGER NOT NULL,
+    to_version   INTEGER NOT NULL,
+    old_count    INTEGER NOT NULL,
+    new_count    INTEGER NOT NULL,
+    reason       TEXT NOT NULL,
+    minute       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exit_count_corrections_serial
+    ON exit_count_corrections(serial);
+
 -- 修订历史：每次成功的编排变更（场景重置/新增组/纠正组/登记封闭/
 -- 登记容量管制/现场节点滞留报告/推进时间）与编排变更在同一事务内写入；
 -- 快照为提交时刻的完整编排 JSON，落库后不再改动、查询时不按当前场景重算。
@@ -151,10 +181,11 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订历史（revisions 表）不在清空之列：场景重置后旧修订仍可查询，
     修订号继续全局递增。
     """
-    # 人工救援队与其救援任务随场景重置清空；先导关系亦清空；修订历史不在
-    # 清空之列
+    # 人工救援队与其救援任务随场景重置清空；先导关系与出口清点记录（含更正
+    # 历史）亦清空；修订历史不在清空之列
     for table in ("rescue_tasks", "rescue_teams",
                   "delay_reports", "group_prerequisites",
+                  "exit_count_corrections", "exit_counts",
                   "route_steps", "groups", "closures",
                   "capacity_controls", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
@@ -527,6 +558,106 @@ async def load_group_rescue_map(db: aiosqlite.Connection) -> dict[int, dict]:
                  "rescued_exit_id": row[4],
                  "delivery_minute": row[5]}
         for row in rows}
+
+
+# --------------------------------------------------------------------------
+# 出口清点（按组清点实际撤离人数）
+# --------------------------------------------------------------------------
+
+async def insert_exit_count(db: aiosqlite.Connection, *, serial: str,
+                            group_id: int, exit_id: int, count: int,
+                            counted_minute: int, created_minute: int) -> None:
+    """登记一条出口清点记录（调用方负责事务与全部受理校验）。
+
+    初始版本为 1；submitted_count 与 counted 同置为提交人数，此后
+    submitted_count 不再改变（幂等比对用），counted 随更正更新。
+    """
+    await db.execute(
+        """INSERT INTO exit_counts
+           (serial, group_id, exit_id, submitted_count, counted,
+            counted_minute, version, created_minute)
+           VALUES(?,?,?,?,?,?,1,?)""",
+        (serial, group_id, exit_id, count, count, counted_minute,
+         created_minute))
+
+
+def _exit_count_row(row) -> dict:
+    return {"serial": row[0], "group_id": row[1], "exit_id": row[2],
+            "submitted_count": row[3], "counted": row[4],
+            "counted_minute": row[5], "version": row[6],
+            "created_minute": row[7]}
+
+
+async def load_exit_count(db: aiosqlite.Connection,
+                          serial: str) -> dict | None:
+    """按流水号读取一条清点记录；不存在时返回 None。"""
+    async with db.execute(
+            """SELECT serial, group_id, exit_id, submitted_count, counted,
+                      counted_minute, version, created_minute
+               FROM exit_counts WHERE serial=?""", (serial,)) as cur:
+        row = await cur.fetchone()
+    return None if row is None else _exit_count_row(row)
+
+
+async def load_exit_counts(db: aiosqlite.Connection,
+                           group_id: int | None = None) -> list[dict]:
+    """按登记先后列出清点记录；可限定单个组。"""
+    query = ("SELECT serial, group_id, exit_id, submitted_count, counted,"
+             " counted_minute, version, created_minute FROM exit_counts")
+    params: tuple = ()
+    if group_id is not None:
+        query += " WHERE group_id=?"
+        params = (group_id,)
+    query += " ORDER BY rowid"
+    async with db.execute(query, params) as cur:
+        rows = await cur.fetchall()
+    return [_exit_count_row(r) for r in rows]
+
+
+async def group_counted_total(db: aiosqlite.Connection,
+                              group_id: int) -> int:
+    """该组当前生效人数的累计（更正后的口径）。"""
+    async with db.execute(
+            "SELECT COALESCE(SUM(counted), 0) FROM exit_counts "
+            "WHERE group_id=?", (group_id,)) as cur:
+        return int((await cur.fetchone())[0])
+
+
+async def update_exit_count(db: aiosqlite.Connection, *, serial: str,
+                            counted: int, version: int) -> None:
+    """应用一次更正：更新生效人数与版本（调用方负责事务与全部校验）。"""
+    await db.execute(
+        "UPDATE exit_counts SET counted=?, version=? WHERE serial=?",
+        (counted, version, serial))
+
+
+async def insert_exit_count_correction(db: aiosqlite.Connection, *,
+                                       serial: str, from_version: int,
+                                       to_version: int, old_count: int,
+                                       new_count: int, reason: str,
+                                       minute: int) -> None:
+    """追加一条更正历史（保留原值与新值；调用方负责事务）。"""
+    await db.execute(
+        """INSERT INTO exit_count_corrections
+           (serial, from_version, to_version, old_count, new_count,
+            reason, minute)
+           VALUES(?,?,?,?,?,?,?)""",
+        (serial, from_version, to_version, old_count, new_count,
+         reason, minute))
+
+
+async def load_exit_count_corrections(db: aiosqlite.Connection,
+                                      serial: str) -> list[dict]:
+    """按更正先后列出一条清点记录的更正历史（原值与新值均保留）。"""
+    async with db.execute(
+            """SELECT from_version, to_version, old_count, new_count,
+                      reason, minute
+               FROM exit_count_corrections WHERE serial=? ORDER BY id""",
+            (serial,)) as cur:
+        rows = await cur.fetchall()
+    return [{"from_version": r[0], "to_version": r[1], "old_count": r[2],
+             "new_count": r[3], "reason": r[4], "minute": r[5]}
+            for r in rows]
 
 
 # --------------------------------------------------------------------------

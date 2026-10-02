@@ -170,6 +170,84 @@ class RescueTaskListOut(BaseModel):
     tasks: list[RescueTaskOut]
 
 
+# --------------------------------------------------------------------------
+# 出口清点（按组清点实际撤离人数）
+# --------------------------------------------------------------------------
+
+class ExitCountIn(BaseModel):
+    """出口清点提交：非空唯一流水号 + 组号 + 出口号 + 正整数人数 + 非负分钟。"""
+    serial: str = Field(
+        ..., min_length=1,
+        description="非空唯一流水号（幂等键：同内容重试返回原记录，异内容拒绝）")
+    group_id: int = Field(..., ge=1, description="人群组编号")
+    exit_id: int = Field(..., ge=0,
+                         description="清点出口编号（须为当前场景既有出口）")
+    count: int = Field(..., gt=0, description="本次清点人数（正整数）")
+    counted_minute: int = Field(
+        ..., ge=0,
+        description="清点分钟（不早于该组到达/送达分钟、不晚于当前分钟）")
+
+
+class ExitCountCorrectionIn(BaseModel):
+    """清点更正：凭原流水号、原记录版本与非空原因更正为非负人数。"""
+    version: int = Field(..., ge=1,
+                         description="被更正的记录版本（须为记录当前版本）")
+    count: int = Field(..., ge=0, description="更正后人数（非负整数）")
+    reason: str = Field(..., min_length=1, description="非空更正原因")
+
+
+class ExitCountCorrectionOut(BaseModel):
+    from_version: int = Field(description="被更正的记录版本")
+    to_version: int = Field(description="更正后的记录版本")
+    old_count: int = Field(description="更正前人数（原值保留）")
+    new_count: int = Field(description="更正后人数")
+    reason: str = Field(description="更正原因")
+    minute: int = Field(description="受理更正时的当前分钟")
+
+
+class ExitCountRecordOut(BaseModel):
+    serial: str
+    group_id: int
+    exit_id: int
+    count: int = Field(description="当前生效人数（更正后口径）")
+    submitted_count: int = Field(
+        description="首次提交人数（原值保留，不随更正改变）")
+    counted_minute: int = Field(description="清点分钟")
+    version: int = Field(description="记录版本：首次登记为 1，每次更正 +1")
+    created_minute: int = Field(description="首次登记时的当前分钟")
+    corrections: list[ExitCountCorrectionOut] = Field(
+        default_factory=list, description="更正历史（按更正先后）")
+
+
+class ExitCountArrivalOut(BaseModel):
+    """组的可清点到达锚点：fixed 取规划到达，rescued 取实际送达。"""
+    basis: Optional[str] = Field(
+        None, description="planned_arrival=按固定路线抵达 | "
+                          "actual_delivery=人工救援实际送达；未抵达为 null")
+    exit_id: Optional[int] = Field(None, description="抵达/送达出口编号")
+    minute: Optional[int] = Field(None, description="抵达/送达分钟")
+
+
+class GroupTallyOut(BaseModel):
+    group_id: int
+    expected: int = Field(description="应到人数（组人数）")
+    counted: int = Field(description="已清点人数（全部记录当前生效人数之和）")
+    remaining: int = Field(description="未清点人数（应到 - 已清点）")
+    arrival: ExitCountArrivalOut = Field(
+        description="可清点到达锚点（救援送达组采用实际出口与时刻）")
+    records: list[ExitCountRecordOut] = Field(
+        default_factory=list, description="逐条清点记录（含更正历史）")
+
+
+class ExitCountListOut(BaseModel):
+    current_minute: int
+    groups: list[GroupTallyOut]
+
+
+class ExitCountGroupOut(GroupTallyOut):
+    current_minute: int
+
+
 class GroupIn(BaseModel):
     id: int = Field(..., ge=1, description="人群组编号（正整数，唯一）")
     size: int = Field(..., gt=0, description="人数（正整数，整组不可拆分）")

@@ -35,6 +35,13 @@
   最早出发分钟、组编号与路线并列规则。关系变更、时间推进、现场滞留及
   救援结案后立即重排未出发组，已出发组路线及既有放行决定不追溯；成功
   登记与编排修订在同一事务原子落库。
+* 现场在出口按组清点实际撤离人数：每条清点凭非空唯一流水号幂等登记
+  （同内容重试返回原记录、异内容整次拒绝），仅已按固定路线抵达该出口
+  或已由人工救援实际送达该出口的组可登记，清点分钟不早于相应到达/送达
+  分钟、不晚于当前分钟，同组累计人数不得超过组人数；可凭原流水号、
+  记录当前版本与非空原因把一条清点更正为非负人数（保留原值与更正历史，
+  版本失配、对同一版本重复更正或更正后累计超额均整次拒绝）。清点与
+  更正不改编排、不产生修订；场景重置清空全部清点记录。
 
 修订历史
 ========
@@ -59,8 +66,12 @@ from . import db
 from .planner import effective_capacity, plan_group
 from .schemas import (CapacityControlIn, CapacityControlListOut,
                       CapacityControlOut, ClosureIn, ConflictOut,
-                      DelayReportAliasIn, DelayReportIn, GroupChangeOut,
-                      GroupCorrectionIn, GroupIn, GroupPlanOut,
+                      DelayReportAliasIn, DelayReportIn,
+                      ExitCountArrivalOut, ExitCountCorrectionIn,
+                      ExitCountCorrectionOut, ExitCountGroupOut,
+                      ExitCountIn, ExitCountListOut, ExitCountRecordOut,
+                      GroupChangeOut, GroupCorrectionIn, GroupIn,
+                      GroupPlanOut, GroupTallyOut,
                       PlanResponse, PrerequisiteBasisOut, PrerequisiteIn,
                       PrerequisiteListOut, PrerequisiteOut,
                       RescueCompletionIn, RescueDispatchIn,
@@ -99,11 +110,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.4.0",
+    version="1.5.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
                 "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
                 "先导组放行间隔（多级依赖按依赖顺序安排）、"
-                "现场节点滞留报告与人工救援队交接核销。",
+                "现场节点滞留报告与人工救援队交接核销，"
+                "以及出口按组清点实际撤离人数（幂等登记、版本化更正）。",
     lifespan=lifespan,
 )
 
@@ -1717,6 +1729,307 @@ async def complete_rescue(task_id: int, payload: RescueCompletionIn,
     conn = request.app.state.db
     async with request.app.state.lock:
         return await _apply_rescue_completion(conn, task_id, payload)
+
+
+# --------------------------------------------------------------------------
+# 出口清点（按组清点实际撤离人数）
+# --------------------------------------------------------------------------
+
+async def _arrival_anchor(conn: aiosqlite.Connection, group_id: int,
+                          status: str, exit_id: int | None,
+                          arrival_minute: int | None):
+    """组的可清点到达锚点：(basis, exit_id, minute)；不可清点时返回 None。
+
+    * fixed（已出发、路线固定）：按固定路线的规划到达出口与到达分钟
+      （basis=planned_arrival）；
+    * rescued（人工结案送达）：实际送达出口与实际送达分钟
+      （basis=actual_delivery，不取规划字段）；
+    * 其余状态（未出发/待救援/救援中等）：None。
+    """
+    if status == "fixed" and arrival_minute is not None:
+        return "planned_arrival", exit_id, arrival_minute
+    if status == "rescued":
+        async with conn.execute(
+                """SELECT exit_id, delivery_minute FROM rescue_tasks
+                   WHERE group_id=? AND status='completed'""",
+                (group_id,)) as cur:
+            task = await cur.fetchone()
+        if task is not None and task[0] is not None:
+            return "actual_delivery", task[0], task[1]
+    return None
+
+
+async def _exit_count_record_out(conn: aiosqlite.Connection,
+                                 serial: str) -> ExitCountRecordOut:
+    """组装一条清点记录的完整输出（含更正历史）。"""
+    rec = await db.load_exit_count(conn, serial)
+    corrections = await db.load_exit_count_corrections(conn, serial)
+    return ExitCountRecordOut(
+        serial=rec["serial"], group_id=rec["group_id"],
+        exit_id=rec["exit_id"], count=rec["counted"],
+        submitted_count=rec["submitted_count"],
+        counted_minute=rec["counted_minute"], version=rec["version"],
+        created_minute=rec["created_minute"],
+        corrections=[ExitCountCorrectionOut(**c) for c in corrections])
+
+
+async def _build_group_tally(conn: aiosqlite.Connection, group_row,
+                             minute_now: int) -> GroupTallyOut:
+    """按组汇总：应到（组人数）、已清点（当前生效累计）、未清点与逐条记录。"""
+    gid, size, status, g_exit, g_arrival = group_row
+    records = await db.load_exit_counts(conn, gid)
+    counted = sum(r["counted"] for r in records)
+    anchor = await _arrival_anchor(conn, gid, status, g_exit, g_arrival)
+    arrival = ExitCountArrivalOut(
+        basis=anchor[0] if anchor else None,
+        exit_id=anchor[1] if anchor else None,
+        minute=anchor[2] if anchor else None)
+    return GroupTallyOut(
+        group_id=gid, expected=size, counted=counted,
+        remaining=size - counted, arrival=arrival,
+        records=[await _exit_count_record_out(conn, r["serial"])
+                 for r in records])
+
+
+@app.post("/exit-counts", tags=["出口清点"], response_model=ExitCountRecordOut,
+          status_code=201,
+          responses={
+              200: {"description": "同流水号同内容的幂等重试，返回原记录"},
+              409: {"description": "流水号异内容/组未抵达/出口不符/分钟越窗/"
+                                   "累计超额，整次拒绝"},
+              422: {"description": "流水号为空、人数或分钟非法、组或出口不存在"}})
+async def submit_exit_count(payload: ExitCountIn, request: Request):
+    """现场在出口按组清点实际撤离人数（幂等登记）。
+
+    每条清点提交非空唯一流水号、组号、出口号、正整数人数与非负清点分钟。
+    **仅**已按固定路线抵达该出口（``fixed`` 且到达分钟不晚于当前分钟）或
+    已由人工救援实际送达该出口（``rescued``，采用实际出口与实际送达分钟）
+    的组可登记；清点分钟不得早于相应到达/送达分钟、不得晚于当前分钟。
+    同一流水号同内容重试返回原记录（HTTP 200），异内容整次拒绝（409
+    ``EXIT_COUNT_SERIAL_CONFLICT``）；同组累计人数不得超过组人数。
+    登记不改编排、不产生修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+
+        # 幂等：同一流水号同内容重试返回原记录；异内容整次拒绝
+        existing = await db.load_exit_count(conn, payload.serial)
+        if existing is not None:
+            same = (existing["group_id"] == payload.group_id
+                    and existing["exit_id"] == payload.exit_id
+                    and existing["submitted_count"] == payload.count
+                    and existing["counted_minute"] == payload.counted_minute)
+            if same:
+                record = await _exit_count_record_out(conn, payload.serial)
+                return JSONResponse(status_code=200,
+                                    content=record.model_dump())
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "EXIT_COUNT_SERIAL_CONFLICT",
+                    "message": "流水号已登记且提交内容不一致，整次拒绝",
+                    "conflicts": [{
+                        "serial": payload.serial,
+                        "group_id": payload.group_id,
+                        "exit_id": payload.exit_id,
+                        "count": payload.count,
+                        "counted_minute": payload.counted_minute,
+                        "current_minute": minute_now,
+                        "reason": "SERIAL_CONTENT_MISMATCH",
+                        "existing": {
+                            "group_id": existing["group_id"],
+                            "exit_id": existing["exit_id"],
+                            "count": existing["submitted_count"],
+                            "counted_minute": existing["counted_minute"]}}]})
+
+        async with conn.execute(
+                """SELECT size, status, exit_id, arrival_minute
+                   FROM groups WHERE id=?""", (payload.group_id,)) as cur:
+            group = await cur.fetchone()
+        if group is None:
+            raise HTTPException(422, f"人群组 {payload.group_id} 不存在")
+        size, status, g_exit, g_arrival = group
+        async with conn.execute("SELECT 1 FROM exits WHERE node_id=?",
+                                (payload.exit_id,)) as cur:
+            if await cur.fetchone() is None:
+                raise HTTPException(
+                    422, f"出口 {payload.exit_id} 不是当前场景的既有出口")
+
+        def _conflict(reason: str, message: str,
+                      extra: dict) -> JSONResponse:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "EXIT_COUNT_NOT_ACCEPTABLE",
+                    "message": message,
+                    "conflicts": [{
+                        "serial": payload.serial,
+                        "group_id": payload.group_id,
+                        "exit_id": payload.exit_id,
+                        "count": payload.count,
+                        "counted_minute": payload.counted_minute,
+                        "current_minute": minute_now,
+                        "reason": reason, **extra}]})
+
+        # 仅已按固定路线抵达该出口，或已由人工救援实际送达该出口的组可登记
+        anchor = await _arrival_anchor(conn, payload.group_id, status,
+                                       g_exit, g_arrival)
+        if anchor is None or anchor[2] > minute_now:
+            return _conflict(
+                "GROUP_NOT_ARRIVED",
+                "该组尚未按固定路线抵达出口，也未由人工救援实际送达，"
+                "不可登记清点，整次拒绝",
+                {"status": status})
+        basis, arrival_exit, arrival_minute = anchor
+        if payload.exit_id != arrival_exit:
+            return _conflict(
+                "EXIT_MISMATCH",
+                "清点出口与该组抵达/送达出口不符，整次拒绝",
+                {"status": status, "arrival_basis": basis,
+                 "expected_exit_id": arrival_exit})
+        if payload.counted_minute < arrival_minute:
+            return _conflict(
+                "COUNTED_MINUTE_BEFORE_ARRIVAL",
+                "清点分钟早于该组到达/送达分钟，整次拒绝",
+                {"status": status, "arrival_basis": basis,
+                 "arrival_minute": arrival_minute})
+        if payload.counted_minute > minute_now:
+            return _conflict(
+                "COUNTED_MINUTE_IN_FUTURE",
+                "清点分钟晚于当前分钟，整次拒绝",
+                {"status": status})
+        already = await db.group_counted_total(conn, payload.group_id)
+        if already + payload.count > size:
+            return _conflict(
+                "COUNT_EXCEEDS_GROUP_SIZE",
+                "同组累计清点人数将超过组人数，整次拒绝",
+                {"status": status, "group_size": size,
+                 "already_counted": already,
+                 "submitted_count": payload.count})
+
+        async with db.transaction(conn):
+            await db.insert_exit_count(
+                conn, serial=payload.serial, group_id=payload.group_id,
+                exit_id=payload.exit_id, count=payload.count,
+                counted_minute=payload.counted_minute,
+                created_minute=minute_now)
+        record = await _exit_count_record_out(conn, payload.serial)
+        return JSONResponse(status_code=201, content=record.model_dump())
+
+
+@app.post("/exit-counts/{serial}/correction", tags=["出口清点"],
+          response_model=ExitCountRecordOut,
+          responses={
+              404: {"description": "清点流水号不存在"},
+              409: {"description": "版本失配/对同一版本重复更正/更正后累计超额，"
+                                   "整次拒绝"},
+              422: {"description": "版本、人数或原因非法"}})
+async def correct_exit_count(serial: str, payload: ExitCountCorrectionIn,
+                             request: Request):
+    """凭原流水号、原记录版本与非空原因，把一条清点更正为非负人数。
+
+    更正保留原值与历史（每次更正追加一条历史记录，含原值、新值、原因与
+    受理分钟），记录版本 +1，并按更正后的同组累计数复核组人数上限。
+    版本失配（``VERSION_MISMATCH``）、对同一版本重复更正
+    （``VERSION_ALREADY_CORRECTED``）或更正后累计超额
+    （``COUNT_EXCEEDS_GROUP_SIZE``）均整次拒绝（409），记录与历史不变；
+    未知流水号 404。更正不改编排、不产生修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        record = await db.load_exit_count(conn, serial)
+        if record is None:
+            raise HTTPException(404, f"清点流水号 {serial} 不存在")
+
+        def _conflict(reason: str, message: str,
+                      extra: dict) -> JSONResponse:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "EXIT_COUNT_CORRECTION_NOT_ACCEPTABLE",
+                    "message": message,
+                    "conflicts": [{
+                        "serial": serial, "group_id": record["group_id"],
+                        "submitted_version": payload.version,
+                        "current_version": record["version"],
+                        "count": payload.count,
+                        "current_minute": minute_now,
+                        "reason": reason, **extra}]})
+
+        if payload.version < record["version"]:
+            return _conflict(
+                "VERSION_ALREADY_CORRECTED",
+                "该版本已被更正过（对同一版本重复更正），整次拒绝", {})
+        if payload.version > record["version"]:
+            return _conflict(
+                "VERSION_MISMATCH",
+                "提交版本与记录当前版本不符，整次拒绝", {})
+        async with conn.execute("SELECT size FROM groups WHERE id=?",
+                                (record["group_id"],)) as cur:
+            size = int((await cur.fetchone())[0])
+        already = await db.group_counted_total(conn, record["group_id"])
+        new_total = already - record["counted"] + payload.count
+        if new_total > size:
+            return _conflict(
+                "COUNT_EXCEEDS_GROUP_SIZE",
+                "更正后同组累计清点人数将超过组人数，整次拒绝",
+                {"group_size": size, "already_counted": already,
+                 "corrected_count": payload.count})
+
+        async with db.transaction(conn):
+            await db.update_exit_count(
+                conn, serial=serial, counted=payload.count,
+                version=record["version"] + 1)
+            await db.insert_exit_count_correction(
+                conn, serial=serial, from_version=record["version"],
+                to_version=record["version"] + 1,
+                old_count=record["counted"], new_count=payload.count,
+                reason=payload.reason, minute=minute_now)
+        return await _exit_count_record_out(conn, serial)
+
+
+@app.get("/exit-counts", tags=["出口清点"], response_model=ExitCountListOut)
+async def list_exit_counts(request: Request):
+    """按组列出全部清点台账：应到、已清点、未清点人数及逐条记录。
+
+    已按固定路线抵达的组采用规划到达出口与分钟；人工救援送达的组采用
+    实际出口与实际送达分钟（``actual_delivery``）；尚未抵达的组到达锚点
+    为 null。场景重置清空全部清点记录。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                """SELECT id, size, status, exit_id, arrival_minute
+                   FROM groups ORDER BY id""") as cur:
+            rows = await cur.fetchall()
+        groups = [await _build_group_tally(conn, row, minute_now)
+                  for row in rows]
+    return ExitCountListOut(current_minute=minute_now, groups=groups)
+
+
+@app.get("/exit-counts/{group_id}", tags=["出口清点"],
+         response_model=ExitCountGroupOut,
+         responses={404: {"description": "人群组不存在"}})
+async def get_group_exit_counts(group_id: int, request: Request):
+    """按组查询清点台账：应到、已清点、未清点人数及逐条记录（含更正历史）。
+
+    救援送达组采用实际出口与实际送达分钟作为到达锚点；未知组号 404。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                """SELECT id, size, status, exit_id, arrival_minute
+                   FROM groups WHERE id=?""", (group_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, f"人群组 {group_id} 不存在")
+        tally = await _build_group_tally(conn, row, minute_now)
+    return ExitCountGroupOut(current_minute=minute_now,
+                             **tally.model_dump())
 
 
 @app.post("/tick", tags=["时间"], response_model=PlanResponse)

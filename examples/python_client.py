@@ -312,6 +312,68 @@ if __name__ == "__main__":
     status, payload = call("GET", "/rescue-tasks/999999")
     show("未知任务号（预期 404）", status, payload)
 
+    # ---- 出口清点：按组清点实际撤离人数 ----
+    # 组 1 已由人工救援实际送达出口 6（送达分钟 12，当前分钟 12）：
+    # 清点采用实际出口与实际送达分钟（actual_delivery）
+    count_body = {"serial": "CNT-0001", "group_id": 1, "exit_id": 6,
+                  "count": 6, "counted_minute": 12}
+    status, payload = call("POST", "/exit-counts", count_body)
+    show("登记出口清点（救援送达组按实际出口与时刻）", status, payload)
+
+    status, payload = call("POST", "/exit-counts", count_body)
+    show("同流水号同内容重试（预期 200 返回原记录）", status, payload)
+    status, payload = call("POST", "/exit-counts",
+                           {**count_body, "count": 7})
+    show("同流水号异内容（预期 409 EXIT_COUNT_SERIAL_CONFLICT）",
+         status, payload)
+    status, payload = call("POST", "/exit-counts",
+                           {"serial": "CNT-0002", "group_id": 1, "exit_id": 6,
+                            "count": 1, "counted_minute": 11})
+    show("清点分钟早于实际送达分钟（预期 409）", status, payload)
+
+    # 凭原流水号、记录版本与非空原因更正为非负人数（保留原值与历史）
+    status, payload = call("POST", "/exit-counts/CNT-0001/correction",
+                           {"version": 1, "count": 5,
+                            "reason": "复核实为 5 人"})
+    show("更正清点为 5 人（版本 1->2，原值保留）", status, payload)
+    status, payload = call("POST", "/exit-counts/CNT-0001/correction",
+                           {"version": 1, "count": 4, "reason": "重复更正"})
+    show("对同一版本重复更正（预期 409 VERSION_ALREADY_CORRECTED）",
+         status, payload)
+
+    status, payload = call("GET", "/exit-counts/1")
+    show("按组查询清点台账（应到/已清点/未清点/逐条记录）", status, payload)
+
+    # 固定路线抵达组：重置为直达场景，组1 t=2 抵达出口6，推进到第3分钟
+    status, plan = call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 6, "minutes": 2, "capacity": 20},
+        ],
+        "exits": [5, 6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30},
+            {"id": 2, "size": 5, "origin": 1, "earliest_departure": 10,
+             "priority": 5, "deadline": 30},
+        ],
+    })
+    assert status == 200
+    call("POST", "/tick", {"minutes": 3})
+    status, payload = call("POST", "/exit-counts",
+                           {"serial": "CNT-1001", "group_id": 1, "exit_id": 6,
+                            "count": 4, "counted_minute": 2})
+    show("固定路线抵达组登记清点（planned_arrival）", status, payload)
+    status, payload = call("POST", "/exit-counts",
+                           {"serial": "CNT-1002", "group_id": 2, "exit_id": 6,
+                            "count": 1, "counted_minute": 3})
+    show("未抵达组登记（预期 409 GROUP_NOT_ARRIVED）", status, payload)
+    status, payload = call("POST", "/exit-counts",
+                           {"serial": "CNT-1003", "group_id": 1, "exit_id": 6,
+                            "count": 99, "counted_minute": 3})
+    show("累计超组人数（预期 409 COUNT_EXCEEDS_GROUP_SIZE）", status, payload)
+    status, payload = call("GET", "/exit-counts")
+    show("全部组清点台账汇总", status, payload)
+
     # ---- 先导组关系与非负放行间隔 ----
     # 双路场景：1->2(4)->6(2) 与 1->4(3)->6(2)
     status, plan = call("POST", "/scenario", {
